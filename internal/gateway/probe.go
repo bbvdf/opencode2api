@@ -150,7 +150,7 @@ func (g *Gateway) probeAttempt(parent context.Context, client *http.Client, key,
 	ctx, cancel := context.WithTimeout(parent, 60*time.Second)
 	defer cancel()
 	ids.Request = identity.RandomID("req", 16)
-	req, err := newUpstreamRequest(ctx, g.cfg.Upstream.Zen, protocol, b, ids, key)
+	req, err := newUpstreamRequest(ctx, g.cfg.Upstream.Zen, protocol, b, ids, key, false)
 	if err != nil {
 		return probeResult{reason: "request_creation_error"}
 	}
