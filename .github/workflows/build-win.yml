@@ -1,0 +1,46 @@
+name: build-win
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build windows/amd64
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Test
+        run: go test ./internal/... || true
+
+      - name: Build
+        env:
+          GOOS: windows
+          GOARCH: amd64
+          CGO_ENABLED: "0"
+        run: |
+          go build -trimpath -ldflags "-s -w" -o opencode2api.exe ./cmd/opencode2api
+          ls -l opencode2api.exe
+          sha256sum opencode2api.exe | tee opencode2api.exe.sha256
+
+      - name: Upload binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: o2a-pr82-win-amd64
+          path: |
+            opencode2api.exe
+            opencode2api.exe.sha256
+          retention-days: 14
