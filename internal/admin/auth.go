@@ -100,6 +100,19 @@ type sessionContextKey struct{}
 
 func (a *Server) authenticate(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Loopback clients are the local operator: skip the login step, but keep
+		// requiring the CSRF token so a rebound page cannot drive the console.
+		if isLoopbackRequest(r) {
+			cfg := a.manager.Config()
+			session := adminSession{
+				Username:    cfg.WebUI.Username,
+				AuthVersion: config.Fingerprint(cfg.WebUI.PasswordHash),
+				CSRF:        localBypassCSRF,
+				Expires:     time.Now().Add(time.Hour),
+			}
+			next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), sessionContextKey{}, session)))
+			return
+		}
 		cookie, err := r.Cookie(adminCookieName)
 		if err != nil || cookie.Value == "" {
 			writeAdminError(w, http.StatusUnauthorized, "authentication_required", "login required")
@@ -254,12 +267,32 @@ func tokenDigest(token string) string {
 	return hex.EncodeToString(sum[:])
 }
 
-func clientIP(r *http.Request) string {
-	host, _, err := net.SplitHostPort(r.RemoteAddr)
-	if err == nil {
-		return host
+// localBypassCSRF is the CSRF token handed to loopback clients that skip login.
+const localBypassCSRF = "loopback-operator"
+
+// isLoopbackRequest reports whether the request both comes from this machine and
+// addresses it by a loopback name, so a DNS-rebound page cannot reach the console.
+func isLoopbackRequest(r *http.Request) bool {
+	if ip := net.ParseIP(hostOnly(r.RemoteAddr)); ip == nil || !ip.IsLoopback() {
+		return false
 	}
-	return r.RemoteAddr
+	host := hostOnly(r.Host)
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
+}
+
+func hostOnly(address string) string {
+	if host, _, err := net.SplitHostPort(address); err == nil {
+		return strings.Trim(host, "[]")
+	}
+	return strings.Trim(address, "[]")
+}
+
+func clientIP(r *http.Request) string {
+	return hostOnly(r.RemoteAddr)
 }
 
 func requestIsSecure(r *http.Request) bool {
