@@ -11,17 +11,31 @@ import (
 
 	"opencode2api/internal/config"
 	"opencode2api/internal/httpx"
+	"opencode2api/internal/telemetry"
 )
 
+// APIKeyView is a server key as the API keys page lists it: its Fingerprint
+// ID, its name (a numbered placeholder when none is stored), the masked value,
+// whether it is enabled, and its usage.
 type APIKeyView struct {
-	ID        string     `json:"id"`
-	Name      string     `json:"name"`
-	Display   string     `json:"display"`
-	Enabled   bool       `json:"enabled"`
-	CreatedAt *time.Time `json:"created_at,omitempty"`
+	ID        string      `json:"id"`
+	Name      string      `json:"name"`
+	Display   string      `json:"display"`
+	Enabled   bool        `json:"enabled"`
+	CreatedAt *time.Time  `json:"created_at,omitempty"`
+	Usage     APIKeyUsage `json:"usage"`
 }
 
-func apiKeyViews(cfg config.Config) []APIKeyView {
+// APIKeyUsage is in-memory like the rest of telemetry.Metrics: it restarts
+// from zero with the process and survives hot reloads. Window covers the last
+// hour.
+type APIKeyUsage struct {
+	Lifetime telemetry.ServerKeyUsage `json:"lifetime"`
+	Window   telemetry.ServerKeyUsage `json:"last_hour"`
+}
+
+func (a *Server) apiKeyViews(cfg config.Config) []APIKeyView {
+	lifetime, window := a.monitor.ServerKeyUsage()
 	items := make([]APIKeyView, 0, len(cfg.ServerKeys))
 	for i, key := range cfg.ServerKeys {
 		id := config.Fingerprint(key)
@@ -30,7 +44,10 @@ func apiKeyViews(cfg config.Config) []APIKeyView {
 		if name == "" {
 			name = fmt.Sprintf("已有 Key %d", i+1)
 		}
-		item := APIKeyView{ID: id, Name: name, Display: config.MaskValue(key), Enabled: !meta.Disabled}
+		item := APIKeyView{
+			ID: id, Name: name, Display: config.MaskValue(key), Enabled: !meta.Disabled,
+			Usage: APIKeyUsage{Lifetime: lifetime[id], Window: window[id]},
+		}
 		if !meta.CreatedAt.IsZero() {
 			created := meta.CreatedAt
 			item.CreatedAt = &created
@@ -42,9 +59,10 @@ func apiKeyViews(cfg config.Config) []APIKeyView {
 
 func (a *Server) handleListAPIKeys(w http.ResponseWriter, _ *http.Request) {
 	w.Header().Set("Cache-Control", "no-store")
-	httpx.WriteJSON(w, http.StatusOK, map[string]any{"keys": apiKeyViews(a.manager.Config())})
+	httpx.WriteJSON(w, http.StatusOK, map[string]any{"keys": a.apiKeyViews(a.manager.Config())})
 }
 
+// validateKeyName requires a name of 1-80 characters.
 func validateKeyName(name string) error {
 	if name == "" || len([]rune(name)) > 80 {
 		return errors.New("名称需为 1–80 个字符")
@@ -52,6 +70,9 @@ func validateKeyName(name string) error {
 	return nil
 }
 
+// addAPIKey appends key as a new server key named name. The name must have
+// 1-80 characters and the key 16-256 characters from [A-Za-z0-9._-]; at most
+// 200 keys are allowed, and a key whose fingerprint already exists is refused.
 func addAPIKey(cfg *config.Config, name, key string) error {
 	if err := validateKeyName(name); err != nil {
 		return err
@@ -81,6 +102,9 @@ func addAPIKey(cfg *config.Config, name, key string) error {
 	return nil
 }
 
+// handleCreateAPIKey adds a server key, generating "sk-local-" plus 48 hex
+// digits when the request carries no value, and answers with the plaintext
+// key next to the updated, masked list.
 func (a *Server) handleCreateAPIKey(w http.ResponseWriter, r *http.Request) {
 	var input struct {
 		Name  string `json:"name"`
@@ -105,9 +129,12 @@ func (a *Server) handleCreateAPIKey(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.Header().Set("Cache-Control", "no-store")
-	httpx.WriteJSON(w, 201, map[string]any{"key": key, "keys": apiKeyViews(a.manager.Config())})
+	httpx.WriteJSON(w, 201, map[string]any{"key": key, "keys": a.apiKeyViews(a.manager.Config())})
 }
 
+// changeAPIKey renames, enables or disables, or (with remove) deletes the
+// server key whose fingerprint is id. A change that would leave no enabled
+// key is refused.
 func changeAPIKey(cfg *config.Config, id string, name *string, enabled *bool, remove bool) error {
 	index := -1
 	for i, key := range cfg.ServerKeys {
