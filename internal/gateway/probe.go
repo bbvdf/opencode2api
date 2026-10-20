@@ -100,25 +100,36 @@ func (g *Gateway) probeFreeModel(ctx context.Context, model string) probeResult 
 	type lane struct {
 		key, name, baseURL string
 		client             *http.Client
+		exit               string
 	}
 	var lanes []lane
+	anonymousCooling := false
 	if g.cfg.Anonymous {
 		cursor := g.anonymous.CursorFor(ids.Session)
 		if node := cursor.Next(); node != nil {
-			// Try the anonymous upstreams in preference order: the v2
-			// /inference origin before the v1 fallback.
-			for _, baseURL := range g.anonymousUpstreams() {
-				lanes = append(lanes, lane{anonymousZenKey, "anonymous", baseURL, g.inferenceClient(node.proxy, baseURL, model)})
+			if g.abuse.Blocked(node.proxy.name) {
+				// A probe is a request too: sending it from a cooling exit only
+				// extends the upstream penalty.
+				anonymousCooling = true
+			} else {
+				// Try the anonymous upstreams in preference order: the v2
+				// /inference origin before the v1 fallback.
+				for _, baseURL := range g.anonymousUpstreams() {
+					lanes = append(lanes, lane{anonymousZenKey, "anonymous", baseURL, g.inferenceClient(node.proxy, baseURL, model), node.proxy.name})
+				}
 			}
 		}
 	}
 	cursor := g.zenNodes.CursorFor(ids.Session)
 	if node := cursor.Next(); node != nil {
 		if proxy := g.zenNodes.Proxy(node); proxy != nil {
-			lanes = append(lanes, lane{node.key, "zen", g.cfg.Upstream.Zen, g.inferenceClient(proxy, g.cfg.Upstream.Zen, model)})
+			lanes = append(lanes, lane{node.key, "zen", g.cfg.Upstream.Zen, g.inferenceClient(proxy, g.cfg.Upstream.Zen, model), proxy.name})
 		}
 	}
 	result := probeResult{reason: "no_probe_channel"}
+	if len(lanes) == 0 && anonymousCooling {
+		result.reason = "network_abuse_blocked"
+	}
 	inconclusive := ""
 	for _, lane := range lanes {
 		if ctx.Err() != nil {
@@ -129,6 +140,14 @@ func (g *Gateway) probeFreeModel(ctx context.Context, model string) probeResult 
 		}
 		result = run("")
 		result.channel = lane.name
+		if result.reason == "network_abuse_blocked" {
+			// The exit, not the model, is refusing the free tier. Cool it down
+			// and stop: every further lane leaves from the same address.
+			if lane.exit != "" {
+				g.abuse.Block(lane.exit)
+			}
+			return result
+		}
 		if result.success {
 			if g.cfg.ForcedEffort(model) == "auto" && protocol != wire.SystemOne {
 				if !g.catalog.MetadataForTier(model, config.TierZen).Reasoning {
@@ -205,6 +224,10 @@ func (g *Gateway) probeAttempt(parent context.Context, client *http.Client, base
 			result.effortRejected = isEffortRejection(resp.StatusCode, string(body))
 			if isModelUnavailable(resp.StatusCode, string(body)) {
 				result.reason = "model_unavailable"
+			} else if resp.StatusCode == http.StatusForbidden && isFreeAbuseBlock(body) {
+				// Distinguish an exit-level abuse block from a request-shape
+				// rejection, which http_403 alone cannot tell apart.
+				result.reason = "network_abuse_blocked"
 			}
 		}
 		return result

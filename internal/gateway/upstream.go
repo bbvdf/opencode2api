@@ -237,6 +237,24 @@ func (g *Gateway) doUpstreamTiers(ctx context.Context, route models.Route, bodie
 			return resp, route, attempts, nil
 		}
 		lastResponse, lastErr = resp, err
+		if errors.Is(err, errFreeTierBlocked) {
+			// The exit is cooling down. A Zen keyed tier leaves from the same
+			// address and answers with the same block, so only a tier that is
+			// not served by the free gateway (Go) is still worth trying.
+			onlyZen := true
+			for _, tier := range route.KeyTiers {
+				if tier != config.TierZen {
+					onlyZen = false
+					break
+				}
+			}
+			if len(route.KeyTiers) == 0 || onlyZen {
+				if lastResponse != nil {
+					httpx.DrainAndClose(lastResponse.Body)
+				}
+				return nil, route, attempts, errFreeTierBlocked
+			}
+		}
 		if len(route.KeyTiers) > 0 {
 			g.logger.Debug("anonymous request did not succeed; entering preferred key tiers", "component", "upstream", "event", "anonymous_fallback", "request_id", ids.Request, "attempts", attempts, "key_tiers", route.KeyTiers)
 		}
@@ -312,6 +330,7 @@ func (g *Gateway) doAnonymousUpstream(ctx context.Context, route models.Route, b
 	}
 	proxies := 0
 	attempts := 0
+	blockedExit := false
 	rawBody := bodies[config.TierZen]
 	if len(rawBody) == 0 {
 		return nil, errors.New("no prepared Zen request body"), 0
@@ -344,6 +363,13 @@ func (g *Gateway) doAnonymousUpstream(ctx context.Context, route models.Route, b
 			break
 		}
 		proxies++
+		if g.abuse.Blocked(node.proxy.name) {
+			// Upstream says retrying lengthens the penalty, so an exit that is
+			// already cooling down must not receive another anonymous request.
+			g.logger.Debug("anonymous exit is cooling down after a free-tier abuse block", "component", "upstream", "event", "anonymous_exit_cooling", "request_id", ids.Request, "tier", config.TierZen, "proxy", config.RedactURL(node.proxy.name))
+			blockedExit = true
+			continue
+		}
 		var nodeResp *http.Response
 		var nodeErr error
 		for index, baseURL := range upstreams {
@@ -386,9 +412,20 @@ func (g *Gateway) doAnonymousUpstream(ctx context.Context, route models.Route, b
 			nodeResp, nodeErr = resp, err
 			g.recordUpstreamAttempt(ctx, route, ids, attemptOffset+attempts, "anonymous", "anonymous", true, node.proxy, resp, err, duration)
 			if err == nil && resp.StatusCode/100 == 2 {
+				g.abuse.Clear(node.proxy.name)
 				g.observeAnonymousResult(ctx, node, resp, nil)
 				g.logger.Debug("anonymous upstream accepted request", "component", "upstream", "event", "anonymous_attempt_succeeded", "request_id", ids.Request, "attempt", attempts, "tier", config.TierZen, "upstream", config.RedactURL(baseURL), "key_id", "anonymous", "channel", "anonymous", "anonymous", true, "proxy", config.RedactURL(node.proxy.name), "status", resp.StatusCode, "duration_ms", duration.Milliseconds())
 				return resp, nil, attempts
+			}
+			if resp != nil && resp.StatusCode == http.StatusForbidden && isFreeAbuseBlock(peekResponseBody(resp, freeAbusePeekLimit)) {
+				// The block belongs to the exit, not to the lane: cool it down
+				// and stop the walk instead of firing the second upstream from
+				// the same address, which only lengthens the penalty.
+				strikes, cooldown := g.abuse.Block(node.proxy.name)
+				g.logger.Warn("free tier blocked this exit; cooling the exit down", "component", "upstream", "event", "anonymous_exit_blocked", "request_id", ids.Request, "tier", config.TierZen, "upstream", config.RedactURL(baseURL), "proxy", config.RedactURL(node.proxy.name), "strikes", strikes, "cooldown_seconds", int(cooldown.Seconds()))
+				httpx.DrainAndClose(resp.Body)
+				lastResponse, lastErr = nil, errFreeTierBlocked
+				break
 			}
 			lastResponse = resp
 			lastErr = asProxyUnavailable(node.proxy, err)
@@ -413,6 +450,11 @@ func (g *Gateway) doAnonymousUpstream(ctx context.Context, route models.Route, b
 		return lastResponse, nil, attempts
 	}
 	if lastErr == nil {
+		if blockedExit {
+			// Nothing was sent: every exit is inside its abuse penalty window.
+			// Report the block instead of a generic pool error.
+			return nil, errFreeTierBlocked, attempts
+		}
 		lastErr = errors.New("no healthy anonymous proxies available")
 		if !g.transports.hasHealthy() {
 			lastErr = fmt.Errorf("no healthy anonymous proxies available: %w", errProxyUnavailable)

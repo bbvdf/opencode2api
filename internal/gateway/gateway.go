@@ -75,6 +75,9 @@ type Gateway struct {
 	zenNodes     *upstreamNodes
 	goNodes      *upstreamNodes
 	anonymous    *anonymousNodes
+	// abuse remembers which exits the free tier is currently refusing after an
+	// IP-abuse block, so retries and background probes stop feeding the penalty.
+	abuse        *exitBlocks
 	catalog      *models.ModelCatalog
 	monitor      *telemetry.Metrics
 	availability *models.AvailabilityRegistry
@@ -120,6 +123,7 @@ func New(cfg config.Config, logger *slog.Logger, monitor *telemetry.Metrics) (*G
 		zenNodes:       zenNodes,
 		goNodes:        goNodes,
 		anonymous:      anonymousPool(cfg.Anonymous, transports, cooldown),
+		abuse:          newExitBlocks(),
 		catalog:        catalog,
 		monitor:        monitor,
 		attemptTimeout: attemptDeadline(cfg),
@@ -306,6 +310,16 @@ func (g *Gateway) handleInference(external wire.Protocol) http.HandlerFunc {
 				return
 			}
 			g.logger.Warn("all upstream attempts failed", "component", "upstream", "event", "request_failed", "request_id", ids.Request, "tier", finalTier, "key_id", keyID, "channel", channel, "anonymous", anonymous, "error", err)
+			// The free tier is refusing this exit after its abuse detection.
+			// Say so instead of forwarding upstream's "turn your VPN off" text
+			// or blaming the upstream with a 502.
+			if errors.Is(err, errFreeTierBlocked) {
+				if meta != nil {
+					meta.Outcome = "free_tier_ip_blocked"
+				}
+				wire.WriteError(w, external, http.StatusServiceUnavailable, freeTierBlockedMessage, "free_tier_ip_blocked", ids.Request)
+				return
+			}
 			// The final attempt never reached the upstream because its proxy
 			// route failed; report that instead of blaming the upstream with
 			// a 502.
@@ -485,6 +499,13 @@ func (g *Gateway) forwardSystemOne(w http.ResponseWriter, r *http.Request, body 
 			return
 		}
 		g.logger.Warn("all upstream attempts failed", "component", "upstream", "event", "request_failed", "request_id", ids.Request, "tier", finalTier, "key_id", keyID, "channel", channel, "anonymous", anonymous, "error", err)
+		if errors.Is(err, errFreeTierBlocked) {
+			if meta != nil {
+				meta.Outcome = "free_tier_ip_blocked"
+			}
+			wire.WriteError(w, wire.SystemOne, http.StatusServiceUnavailable, freeTierBlockedMessage, "free_tier_ip_blocked", ids.Request)
+			return
+		}
 		if errors.Is(err, errProxyUnavailable) {
 			wire.WriteError(w, wire.SystemOne, http.StatusServiceUnavailable, proxyUnavailableMessage, "proxy_error", ids.Request)
 			return
